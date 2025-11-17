@@ -1,0 +1,4 @@
+streamlit
+pandas
+openpyxl
+openai  # Optional: For the AI stub; swap for grok-python if xAI API
