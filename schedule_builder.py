@@ -7,12 +7,17 @@ from io import BytesIO
 from typing import Optional, Dict, List
 import tempfile
 
-# Constants from the original script - UPDATED TIME GAPS
+# Constants from the original script - UPDATED FOR EXTENDED ZONES
 KM_LIMIT = 125.0         # hard max km per schedule
 MAX_HOURS = 12.0         # max duration first pickup -> last drop (hours)
-MAX_ZONE_DEPTH = 2       # 0,1,2 hops allowed
-GAP_NEAR = 15            # minutes for distance 0 or 1 (same/neighbor zone)
-GAP_FAR = 20             # minutes for distance 2 (third neighboring zone)
+MAX_ZONE_DEPTH = 4       # 0,1,2,3,4 hops allowed
+GAP_RULES = {            # Time gaps by distance
+    0: 10,  # same zone
+    1: 10,  # direct neighbor
+    2: 15,  # 2-hop
+    3: 20,  # 3-hop
+    4: 25   # 4-hop
+}
 
 # Adapted functions from the original script
 # (load_trips and load_zone_graph now accept file-like objects instead of paths)
@@ -52,7 +57,7 @@ def load_zone_graph(uploaded_file) -> dict:
                 neighbors[b].add(p)  # symmetric
     return neighbors
 
-def zone_distance(neighbors: dict, start: int, target: int, max_depth: int = 2):
+def zone_distance(neighbors: dict, start: int, target: int, max_depth: int = 4):
     """BFS up to max_depth; return distance (0..max_depth) or None if >max_depth/unreachable."""
     start = int(start)
     target = int(target)
@@ -109,11 +114,11 @@ def build_schedules(trips: pd.DataFrame, neighbors: dict):
                 if dist is None or dist > MAX_ZONE_DEPTH:
                     continue
 
-                # Time gap rule
-                if dist in (0, 1):
-                    min_gap = GAP_NEAR
-                else:  # dist == 2
-                    min_gap = GAP_FAR
+                # Time gap rule based on distance
+                if dist in GAP_RULES:
+                    min_gap = GAP_RULES[dist]
+                else:
+                    continue  # Should not happen, but safety
 
                 min_pickup_time = min_pickup_time_base + timedelta(minutes=min_gap)
                 pick_time = trips.loc[i, "pickup_dt"]
@@ -201,10 +206,8 @@ def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict) -> pd.D
                 delta_min = int((pickup_dt - prev_drop_time).total_seconds() / 60.0)
                 dist = zone_distance(neighbors, prev_drop_zone, pick_zone, max_depth=MAX_ZONE_DEPTH)
 
-                if dist in (0, 1):
-                    gap_rule = f"{GAP_NEAR}-minute gap rule (same/neighbor zone)"
-                elif dist == 2:
-                    gap_rule = f"{GAP_FAR}-minute gap rule (2-hop/third neighboring zone)"
+                if dist in GAP_RULES:
+                    gap_rule = f"{GAP_RULES[dist]}-minute gap rule (distance {dist}-hop zone)"
                 else:
                     gap_rule = "zone distance exceeded allowed range (this should not happen)"
 
@@ -304,7 +307,7 @@ def get_ai_suggestions(affected_schedules: List[Dict], available_drivers: int, a
     Analyze these disrupted schedules: {json.dumps(affected_schedules[:3], indent=2)}.
     You have {available_drivers} additional drivers available.
     
-    Suggest 2-3 practical fixes to minimize total KM, respect 15-20 min time gaps (15 for same/neighbor zones, 20 for 2-hop), and limit zone hops to 2. 
+    Suggest 2-3 practical fixes to minimize total KM, respect time gaps by zone distance (10 min for 0/1-hop, 15 for 2-hop, 20 for 3-hop, 25 for 4-hop), and limit zone hops to 4. 
     Prioritize swaps, merges, or new assignments for affected trips.
     Output as a concise bulleted list:
     - Suggestion 1: [Brief action] ([Estimated impact, e.g., saves 5km])
