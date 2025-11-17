@@ -252,7 +252,7 @@ def apply_updates(trips: pd.DataFrame, updates: Optional[pd.DataFrame], existing
     
     if updates is not None:
         for _, row in updates.iterrows():
-            run_num = row['Run Number']  # Or 'TTM Number'
+            run_num = row['Run Number']  # Or 'TTM Number' - adjust if your col is 'TTM Number'
             mask = updated_trips['TTM Number'] == run_num  # Adjust col if needed
             if row['Status'] == 'canceled':
                 updated_trips.loc[mask, 'Status'] = 'canceled'
@@ -273,8 +273,8 @@ def apply_updates(trips: pd.DataFrame, updates: Optional[pd.DataFrame], existing
     
     return active_trips, updated_trips  # Return active for build, full for details
 
-def repair_schedules(active_trips: pd.DataFrame, neighbors: dict, existing_schedules: List[Dict]) -> List[Dict]:
-    """Incremental rebuild: Repair existing, then add new."""
+def repair_schedules(active_trips: pd.DataFrame, neighbors: dict, existing_schedules: List[Dict], available_drivers: int = 0) -> List[Dict]:
+    """Incremental rebuild: Repair existing, then add new. Cap new schedules by available_drivers."""
     all_schedules = existing_schedules.copy()  # Start with priors (sans cancels)
     unassigned = set(active_trips.index.tolist())
     
@@ -284,13 +284,13 @@ def repair_schedules(active_trips: pd.DataFrame, neighbors: dict, existing_sched
             if idx in unassigned:
                 unassigned.remove(idx)
     
-    # For each existing schedule with gaps, try to fill (greedy insert by time)
-    # Simplified: For now, we'll just filter out empties and rebuild unassigned
+    # Filter out empties
     all_schedules = [s for s in all_schedules if len(s['trip_indices']) > 0]
     
-    # Now build new/remaining with unassigned (as before, but cap by available_drivers if set)
+    # Build new for unassigned, but limit to available_drivers
     new_schedules = build_schedules_from_unassigned(active_trips, neighbors, list(unassigned))
-    all_schedules.extend(new_schedules)
+    all_schedules.extend(new_schedules[:available_drivers])  # Cap new ones
+    
     return all_schedules
 
 # AI Suggestion Hook (with OpenAI)
@@ -324,14 +324,37 @@ def get_ai_suggestions(affected_schedules: List[Dict], available_drivers: int, a
     except Exception as e:
         return f"OpenAI error: {str(e)}"
 
+# Sample Files Data (for downloads)
+SAMPLE_TRIPS_CSV = """TTM Number,First Pickup Time,Last Dropoff Time,First Pickup Zone,Last Dropoff Zone,KM
+001,08:00:00,09:00:00,1,2,25.5
+002,09:20:00,10:30:00,2,3,30.0
+003,10:45:00,11:45:00,3,1,20.0
+"""
+SAMPLE_UPDATES_CSV = """Run Number,Status,First Pickup Time,Last Dropoff Time,First Pickup Zone,Last Dropoff Zone,KM
+001,canceled,,,,
+999,added,11:00:00,12:00:00,4,5,20.0
+"""
+SAMPLE_JSON = """[
+  {
+    "id": "SCH-001",
+    "trip_indices": [0, 1]
+  },
+  {
+    "id": "SCH-002",
+    "trip_indices": [2]
+  }
+]
+"""
+
 # Streamlit app
 st.title("Live Driver Schedule Builder V2")
 
-# Option for zone file: upload once and cache in session state, or upload fresh
+# Global zone cache
 if "neighbors" not in st.session_state:
     st.session_state.neighbors = None
 
-# Zone file uploader (uploaded once, cached)
+# Zone file uploader (global, cached across tabs)
+st.header("Zone Graph (Upload Once)")
 if st.session_state.neighbors is None:
     zones_file = st.file_uploader("Upload zones file (CSV or XLSX) - upload once and reuse", type=["csv", "xlsx"])
     if zones_file:
@@ -344,85 +367,179 @@ else:
         st.session_state.neighbors = None
         st.rerun()
 
-# New: Available drivers slider
-available_drivers = st.slider("Available Additional Drivers", 0, 10, 2)
+if st.session_state.neighbors is None:
+    st.stop()  # Can't proceed without zones
 
-# Existing schedules loader
-existing_json = st.file_uploader("Load Existing Schedules (JSON from prior run)", type="json")
-if existing_json:
-    existing_schedules = json.load(existing_json)
-else:
-    existing_schedules = None
+# Main Tabs
+tab1, tab2 = st.tabs(["Part 1: Initial Scheduling", "Part 2: Rescheduling"])
 
-# Trips & Updates uploaders
-trips_file = st.file_uploader("Upload Today's Trips CSV (or latest)", type="csv")
-updates_file = st.file_uploader("Upload Updates CSV (Cancellations/Add-ons)", type="csv")
-
-# Sample Updates CSV Format
-if not updates_file:
-    st.info("""
-    Updates CSV Example:
-    Run Number,Status,First Pickup Time,Last Dropoff Time,First Pickup Zone,Last Dropoff Zone,KM
-    001,canceled,,,,
-    999,added,11:00:00,12:00:00,4,5,20.0
-    """)
-
-# Handle both initial build and rebuild
-if (st.button("Build/Rebuild Schedules") and trips_file and st.session_state.neighbors) or (existing_json and st.button("Rebuild from Loaded Schedules")):
-    with st.spinner("Processing updates & building/rebuilding..."):
-        trips = load_trips(trips_file)
-        updates = pd.read_csv(updates_file) if updates_file else None
-        existing = load_existing_schedules(uploaded_file=existing_json) if existing_json else None
-        active_trips, full_trips = apply_updates(trips, updates, existing)
-        
-        schedules = repair_schedules(active_trips, st.session_state.neighbors, existing or [])
-        
-        # Check for disruptions
-        disrupted = [s for s in schedules if len(s['trip_indices']) == 0]  # Empty ones
-        if len(disrupted) > available_drivers * 0.5:  # Threshold
-            ai_sugs = get_ai_suggestions(disrupted, available_drivers, st.secrets.get("OPENAI_API_KEY", None))
-            st.warning(f"High disruption detected! AI Suggestions: {ai_sugs}")
-        
-        summary_df = build_summary(full_trips, schedules)  # Use full for details, but active for logic
-        details_df = build_details(full_trips, schedules, st.session_state.neighbors)
-
-    st.success(f"Generated/Rebuilt {len(schedules)} schedules (using {available_drivers} extra drivers).")
-
-    # Display summary table
-    st.subheader("Schedule Summary")
-    st.dataframe(summary_df)
-
-    # Download buttons
-    csv_summary = summary_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Download Summary CSV",
-        data=csv_summary,
-        file_name='schedule_summary.csv',
-        mime='text/csv'
-    )
-
-    csv_details = details_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Download Details CSV",
-        data=csv_details,
-        file_name='full_schedule_details.csv',
-        mime='text/csv'
-    )
-
-    # Optional: Display details table (truncated for view)
-    with st.expander("View Details Table"):
-        st.dataframe(details_df)
+with tab1:
+    st.header("Build Fresh Schedules (e.g., 6am Baseline)")
     
-    # New: Download updated JSON for next run
+    # Sample Trips Download
+    st.subheader("Sample Files")
     st.download_button(
-        label="Download Current Schedules JSON (for next rebuild)",
-        data=json.dumps(schedules, indent=2).encode('utf-8'),
-        file_name='current_schedules.json',
-        mime='application/json'
+        label="Download Sample Trips CSV",
+        data=SAMPLE_TRIPS_CSV,
+        file_name='sample_trips.csv',
+        mime='text/csv'
     )
+    
+    # Trips uploader
+    trips_file = st.file_uploader("Upload Today's Trips CSV", type="csv")
+    
+    if st.button("Build Schedules") and trips_file:
+        with st.spinner("Building schedules..."):
+            trips = load_trips(trips_file)
+            schedules = build_schedules(trips, st.session_state.neighbors)
+            summary_df = build_summary(trips, schedules)
+            details_df = build_details(trips, schedules, st.session_state.neighbors)
 
-else:
-    if not trips_file:
-        st.warning("Please upload the trips CSV.")
-    if st.session_state.neighbors is None:
-        st.warning("Please upload the zones file first.")
+        st.success(f"Generated {len(schedules)} schedules!")
+
+        # Display summary table
+        st.subheader("Schedule Summary")
+        st.dataframe(summary_df)
+
+        # Download buttons
+        csv_summary = summary_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Summary CSV",
+            data=csv_summary,
+            file_name='schedule_summary.csv',
+            mime='text/csv'
+        )
+
+        csv_details = details_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Details CSV",
+            data=csv_details,
+            file_name='full_schedule_details.csv',
+            mime='text/csv'
+        )
+
+        # Optional: Display details table (truncated for view)
+        with st.expander("View Details Table"):
+            st.dataframe(details_df)
+        
+        # Download JSON for Part 2
+        st.download_button(
+            label="Download Schedules JSON (Save for Rescheduling)",
+            data=json.dumps(schedules, indent=2).encode('utf-8'),
+            file_name='current_schedules.json',
+            mime='application/json'
+        )
+
+    else:
+        if not trips_file:
+            st.warning("Please upload the trips CSV.")
+
+with tab2:
+    st.header("Reschedule with Cancellations & Add-Ons (e.g., 11am Updates)")
+    
+    # Sample Files Downloads
+    st.subheader("Sample Files")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button(
+            label="Sample Trips CSV",
+            data=SAMPLE_TRIPS_CSV,
+            file_name='sample_trips.csv',
+            mime='text/csv'
+        )
+    with col2:
+        st.download_button(
+            label="Sample Updates CSV (Cancellations/Add-Ons)",
+            data=SAMPLE_UPDATES_CSV,
+            file_name='sample_updates.csv',
+            mime='text/csv'
+        )
+    with col3:
+        st.download_button(
+            label="Sample Schedules JSON",
+            data=SAMPLE_JSON,
+            file_name='sample_schedules.json',
+            mime='application/json'
+        )
+    
+    # Available drivers slider
+    available_drivers = st.slider("Available Additional Drivers", 0, 10, 2)
+    
+    # Existing schedules loader
+    existing_json = st.file_uploader("Upload Prior Schedules JSON (from Part 1)", type="json")
+    existing_schedules = None
+    if existing_json:
+        existing_schedules = json.load(existing_json)
+        st.success("Prior schedules loaded!")
+    
+    # Trips & Updates uploaders
+    trips_file = st.file_uploader("Upload Trips CSV (for context/active trips)", type="csv")
+    updates_file = st.file_uploader("Upload Updates CSV (Cancellations/Add-Ons)", type="csv")
+    
+    # Updates Format Info
+    st.info("""
+    **Updates CSV Format**:
+    - `Run Number`: Matches TTM Number from trips (for cancels).
+    - `Status`: "canceled" (leave other cols blank) or "added" (fill full trip details).
+    Example row for cancel: Run Number=001, Status=canceled
+    Example row for add-on: Run Number=999, Status=added, First Pickup Time=11:00:00, etc.
+    """)
+    
+    if st.button("Rebuild Schedules") and trips_file:
+        with st.spinner("Processing updates & rebuilding..."):
+            trips = load_trips(trips_file)
+            updates = pd.read_csv(updates_file) if updates_file else None
+            existing = existing_schedules
+            active_trips, full_trips = apply_updates(trips, updates, existing)
+            
+            schedules = repair_schedules(active_trips, st.session_state.neighbors, existing or [], available_drivers)
+            
+            # Check for disruptions (empty schedules)
+            disrupted = [s for s in schedules if len(s['trip_indices']) == 0]
+            if len(disrupted) > 0:  # Simplified threshold
+                ai_sugs = get_ai_suggestions(disrupted, available_drivers, st.secrets.get("OPENAI_API_KEY", None))
+                st.warning(f"Disruptions detected! AI Suggestions: {ai_sugs}")
+            
+            summary_df = build_summary(full_trips, schedules)
+            details_df = build_details(full_trips, schedules, st.session_state.neighbors)
+
+        st.success(f"Rebuilt {len(schedules)} schedules (using {available_drivers} extra drivers).")
+
+        # Display summary table
+        st.subheader("Updated Schedule Summary")
+        st.dataframe(summary_df)
+
+        # Download buttons
+        csv_summary = summary_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Updated Summary CSV",
+            data=csv_summary,
+            file_name='updated_schedule_summary.csv',
+            mime='text/csv'
+        )
+
+        csv_details = details_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Updated Details CSV",
+            data=csv_details,
+            file_name='updated_full_schedule_details.csv',
+            mime='text/csv'
+        )
+
+        # Optional: Display details table (truncated for view)
+        with st.expander("View Updated Details Table"):
+            st.dataframe(details_df)
+        
+        # Download new JSON for next rebuild
+        st.download_button(
+            label="Download Updated Schedules JSON (for Next Reschedule)",
+            data=json.dumps(schedules, indent=2).encode('utf-8'),
+            file_name='updated_schedules.json',
+            mime='application/json'
+        )
+
+    else:
+        if not trips_file:
+            st.warning("Please upload the trips CSV.")
+        if not existing_json:
+            st.warning("Upload prior JSON for full rescheduling (or run Part 1 first).")
