@@ -7,12 +7,12 @@ from io import BytesIO
 from typing import Optional, Dict, List
 import tempfile
 
-# Constants from the original script
+# Constants from the original script - UPDATED TIME GAPS
 KM_LIMIT = 125.0         # hard max km per schedule
 MAX_HOURS = 12.0         # max duration first pickup -> last drop (hours)
 MAX_ZONE_DEPTH = 2       # 0,1,2 hops allowed
-GAP_NEAR = 10            # minutes for distance 0 or 1
-GAP_FAR = 15             # minutes for distance 2
+GAP_NEAR = 15            # minutes for distance 0 or 1 (same/neighbor zone)
+GAP_FAR = 20             # minutes for distance 2 (third neighboring zone)
 
 # Adapted functions from the original script
 # (load_trips and load_zone_graph now accept file-like objects instead of paths)
@@ -204,7 +204,7 @@ def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict) -> pd.D
                 if dist in (0, 1):
                     gap_rule = f"{GAP_NEAR}-minute gap rule (same/neighbor zone)"
                 elif dist == 2:
-                    gap_rule = f"{GAP_FAR}-minute gap rule (2-hop zone)"
+                    gap_rule = f"{GAP_FAR}-minute gap rule (2-hop/third neighboring zone)"
                 else:
                     gap_rule = "zone distance exceeded allowed range (this should not happen)"
 
@@ -290,13 +290,36 @@ def repair_schedules(active_trips: pd.DataFrame, neighbors: dict, existing_sched
     all_schedules.extend(new_schedules)
     return all_schedules
 
-# AI Suggestion Hook (stub—integrate Grok/OpenAI API)
+# AI Suggestion Hook (with OpenAI)
+from openai import OpenAI
+
 def get_ai_suggestions(affected_schedules: List[Dict], available_drivers: int, api_key: Optional[str] = None) -> str:
-    """Query AI for reroute ideas if disruptions > threshold."""
-    prompt = f"Affected schedules: {json.dumps(affected_schedules[:3])}. Available drivers: {available_drivers}. Suggest 2-3 low-impact fixes."
-    # Call to Grok API or openai.ChatCompletion (add your key via st.secrets)
-    # For now, return a placeholder
-    return "Suggestion 1: Swap Trip 002 to Driver 3 (saves 5km). Suggestion 2: Merge SCH-001 & SCH-002."
+    """Query OpenAI for reroute ideas if disruptions > threshold."""
+    if not api_key:
+        return "API key missing—add to secrets.toml."
+    
+    client = OpenAI(api_key=api_key)
+    
+    prompt = f"""You are a logistics AI assistant specializing in driver scheduling. 
+    Analyze these disrupted schedules: {json.dumps(affected_schedules[:3], indent=2)}.
+    You have {available_drivers} additional drivers available.
+    
+    Suggest 2-3 practical fixes to minimize total KM, respect 15-20 min time gaps (15 for same/neighbor zones, 20 for 2-hop), and limit zone hops to 2. 
+    Prioritize swaps, merges, or new assignments for affected trips.
+    Output as a concise bulleted list:
+    - Suggestion 1: [Brief action] ([Estimated impact, e.g., saves 5km])
+    - etc."""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Or "gpt-4o-mini" for better reasoning
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.3  # Low for deterministic suggestions
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"OpenAI error: {str(e)}"
 
 # Streamlit app
 st.title("Live Driver Schedule Builder V2")
@@ -354,7 +377,7 @@ if (st.button("Build/Rebuild Schedules") and trips_file and st.session_state.nei
         # Check for disruptions
         disrupted = [s for s in schedules if len(s['trip_indices']) == 0]  # Empty ones
         if len(disrupted) > available_drivers * 0.5:  # Threshold
-            ai_sugs = get_ai_suggestions(disrupted, available_drivers, st.secrets.get("API_KEY", None))
+            ai_sugs = get_ai_suggestions(disrupted, available_drivers, st.secrets.get("OPENAI_API_KEY", None))
             st.warning(f"High disruption detected! AI Suggestions: {ai_sugs}")
         
         summary_df = build_summary(full_trips, schedules)  # Use full for details, but active for logic
