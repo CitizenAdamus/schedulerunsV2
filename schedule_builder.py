@@ -19,6 +19,13 @@ GAP_RULES = {            # Time gaps by distance
     4: 25   # 4-hop
 }
 
+# List of possible run number column names (for dynamic detection)
+POSSIBLE_RUN_COLS = [
+    "TTM Number", "TTM_Number", "TTM number", "ttm number",
+    "Run Number", "Run_Number", "Run number", "run number",
+    "Run ID", "run_id", "ID", "id"
+]
+
 # Adapted functions from the original script
 # (load_trips and load_zone_graph now accept file-like objects instead of paths)
 
@@ -180,8 +187,17 @@ def build_summary(trips: pd.DataFrame, schedules: list) -> pd.DataFrame:
         )
     return pd.DataFrame(rows)
 
+def get_run_number_col(df: pd.DataFrame) -> str:
+    """Dynamically find the run number column."""
+    for col in POSSIBLE_RUN_COLS:
+        if col in df.columns:
+            return col
+    st.warning("No run number column found (tried: TTM Number, Run Number, etc.). Using index as 'Run ID'.")
+    return "Run ID"
+
 def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict) -> pd.DataFrame:
     rows = []
+    run_col = get_run_number_col(trips)
 
     for s in schedules:
         sid = s["id"]
@@ -189,7 +205,10 @@ def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict) -> pd.D
         cum_km = 0.0
 
         for order, idx in enumerate(idxs, start=1):
-            run_number = trips.loc[idx, "TTM Number"]
+            if run_col == "Run ID":
+                run_number = idx  # Fallback to index
+            else:
+                run_number = trips.loc[idx, run_col]
             pickup_dt = trips.loc[idx, "pickup_dt"]
             drop_dt = trips.loc[idx, "drop_dt"]
             pick_zone = int(trips.loc[idx, "First Pickup Zone"])
@@ -249,11 +268,13 @@ def apply_updates(trips: pd.DataFrame, updates: Optional[pd.DataFrame], existing
     """Process cancellations/add-ons: Filter trips, mark status."""
     updated_trips = trips.copy()
     updated_trips['Status'] = 'active'  # Default
+    run_col = get_run_number_col(updated_trips)
     
     if updates is not None:
+        updates_run_col = get_run_number_col(updates)  # Assume same col name in updates
         for _, row in updates.iterrows():
-            run_num = row['Run Number']  # Or 'TTM Number' - adjust if your col is 'TTM Number'
-            mask = updated_trips['TTM Number'] == run_num  # Adjust col if needed
+            run_num = row[updates_run_col]
+            mask = updated_trips[run_col] == run_num
             if row['Status'] == 'canceled':
                 updated_trips.loc[mask, 'Status'] = 'canceled'
             elif row['Status'] == 'added':
@@ -294,12 +315,15 @@ def repair_schedules(active_trips: pd.DataFrame, neighbors: dict, existing_sched
     return all_schedules
 
 # AI Suggestion Hook (with OpenAI)
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # Graceful if not installed
 
 def get_ai_suggestions(affected_schedules: List[Dict], available_drivers: int, api_key: Optional[str] = None) -> str:
     """Query OpenAI for reroute ideas if disruptions > threshold."""
-    if not api_key:
-        return "API key missing—add to secrets.toml."
+    if not api_key or not OpenAI:
+        return "OpenAI not configured (add key to secrets.toml and install openai)."
     
     client = OpenAI(api_key=api_key)
     
@@ -479,7 +503,7 @@ with tab2:
     # Updates Format Info
     st.info("""
     **Updates CSV Format**:
-    - `Run Number`: Matches TTM Number from trips (for cancels).
+    - `Run Number` (or matching col like TTM Number): ID from trips for cancels.
     - `Status`: "canceled" (leave other cols blank) or "added" (fill full trip details).
     Example row for cancel: Run Number=001, Status=canceled
     Example row for add-on: Run Number=999, Status=added, First Pickup Time=11:00:00, etc.
